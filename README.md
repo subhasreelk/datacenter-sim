@@ -21,32 +21,44 @@ Scalable multi-user login load testing framework — Locust + FastAPI + Promethe
 
 Most server load tests send flat, constant traffic — but real production traffic
 ramps up, spikes, sustains, and cools down, often through multiple interfaces at
-once. This framework reproduces that realism for a **login/authentication
-endpoint**, one of the most concurrency-sensitive parts of any system.
+once, with different user types competing for the same server resources. This
+framework reproduces that realism around a **login/authentication system**, one
+of the most concurrency-sensitive parts of any application.
 
-It simulates a **login storm** — thousands (or millions) of fake users logging in
-within a short window — while monitoring the target server live and automatically
-identifying the exact point where it starts to break down.
+It simulates **three interface types — web, mobile, and API — each with light
+and heavy user variants**, generating realistic session lifecycles (login →
+profile read/update → logout) and sustained machine traffic side by side. This
+creates genuine **cross-interface contention**: a heavy API client hammering
+`/api/data` while web and mobile users are simultaneously logging in and
+refreshing sessions on the same server.
+
+Two time-based traffic patterns are included — a steady **normal day** baseline
+and a sudden **flash event** spike — while monitoring the target server live and
+automatically identifying the exact point where it starts to break down.
 
 ---
 
 ## Architecture
 
 ```
-                    ┌─────────────────┐
-                    │  workload_profiles/
-                    │  login_storm.yaml │  ← defines user count, ramp/peak/cooldown
-                    └────────┬─────────┘
+                    ┌──────────────────────┐
+                    │  workload_profiles/    │
+                    │  normal_day.yaml       │  ← steady baseline pattern
+                    │  flash_event.yaml      │  ← sudden spike pattern
+                    └────────┬───────────────┘
                              │
                     ┌────────▼─────────┐
-                    │   Locust          │  ← simulates fake login traffic
-                    │ (master + workers)│     scales horizontally
-                    └────────┬─────────┘
+                    │   Locust          │  ← WebUser, MobileUser, APIUser
+                    │ (master + workers)│     each with light/heavy variants
+                    └────────┬─────────┘     scales horizontally
                              │ HTTP requests
-                    ┌────────▼─────────┐
-                    │  FastAPI server   │  ← /login /logout /me /health /metrics
-                    │   (test target)   │
-                    └────────┬─────────┘
+                    ┌────────▼──────────────────────┐
+                    │  FastAPI server                │
+                    │  /login /logout /me             │
+                    │  /profile/update /api/data      │
+                    │  /health /metrics                │
+                    │   (test target)                  │
+                    └────────┬──────────────────────┘
                              │ metrics
           ┌──────────────────┼──────────────────┐
           ▼                                       ▼
@@ -79,16 +91,45 @@ All tools are 100% open source — zero licensing cost.
 
 ---
 
+## Server endpoints
+
+| Method | Endpoint | Used by | Purpose |
+|---|---|---|---|
+| POST | `/login` | All users | Authenticate, issue session token |
+| POST | `/logout` | Web users | End session, invalidate token |
+| GET | `/me` | Web + Mobile | Get current user profile (light read) |
+| POST | `/profile/update` | Mobile (heavy), Web (heavy) | Update profile — write-heavy, DB contention |
+| GET | `/api/data` | API users | Sustained machine traffic — resource contention |
+| GET | `/health` | Monitoring | Liveness check |
+| GET | `/metrics` | Prometheus | Exposes request count, latency histograms |
+
+## Simulated user types
+
+Three interface types are simulated, each split into weighted **light** and
+**heavy** variants to model realistic variability in user behaviour:
+
+| User type | Weight | Light variant | Heavy variant |
+|---|---|---|---|
+| **WebUser** | 50% | 80% — login → `/me` → logout, single pass | 20% — login → loop(`/me` + `/profile/update`) → logout |
+| **MobileUser** | 35% | 60% — login → `/me` once | 40% — login → poll `/me` repeatedly (background sync) |
+| **APIUser** | 15% | 30% — login once → occasional `/api/data` | 70% — login once → sustained `/api/data` calls |
+
+The heavy `APIUser` variant is the primary source of **cross-interface
+contention** — it competes for the same server resources (CPU, session store)
+as web and mobile traffic on `/login` and `/me`.
+
+---
+
 ## Folder structure
 
 ```
 datacenter-sim/
-├── app/                     # FastAPI login server
-│   ├── main.py              # /login /logout /me /health /metrics
+├── app/                     # FastAPI server (test target)
+│   ├── main.py              # /login /logout /me /profile/update /api/data /health /metrics
 │   ├── Dockerfile
 │   └── requirements.txt
 ├── simulation/               # Locust load generation
-│   ├── locustfile.py
+│   ├── locustfile.py         # WebUser, MobileUser, APIUser (light + heavy variants)
 │   └── loadshapes.py         # ramp-up / peak / cooldown curves
 ├── infra/                     # Infrastructure
 │   ├── docker-compose.yml
@@ -99,7 +140,8 @@ datacenter-sim/
 │   ├── analyse.py
 │   └── reports/
 ├── workload_profiles/         # Test scenario configs
-│   └── login_storm.yaml
+│   ├── normal_day.yaml       # steady baseline (day/night cycle pattern)
+│   └── flash_event.yaml      # sudden spike (event-driven surge pattern)
 ├── docs/                       # Whitepaper, diagrams, notes
 ├── .gitignore
 └── README.md
@@ -138,8 +180,12 @@ Node Exporter, and Grafana — all on one Docker network.
 
 ### 4. Run a test
 
+Run the steady baseline first, then the spike scenario, so the analysis
+phase can compare them:
+
 ```bash
-python simulation/run_test.py --profile workload_profiles/login_storm.yaml
+python simulation/run_test.py --profile workload_profiles/normal_day.yaml
+python simulation/run_test.py --profile workload_profiles/flash_event.yaml
 ```
 
 ### 5. Scale up workers (for higher simulated user counts)
@@ -184,7 +230,8 @@ running a million-user test on a laptop:
 | CPU utilisation | < 80% |
 | Memory utilisation | < 90% |
 
-Configurable in `workload_profiles/login_storm.yaml`.
+Configurable per-scenario in `workload_profiles/normal_day.yaml` and
+`workload_profiles/flash_event.yaml`.
 
 ---
 
